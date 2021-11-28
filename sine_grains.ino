@@ -1,9 +1,9 @@
 /* Minimal sine generator for testing AE Modular Grains. Very much based
  *  on the dr1.a wonkystuff firmware, so there may be some residual stuff
  *  hanging around from that…
- * 
+ *
  * Pitch is controlled by P1/IN 1
- * 
+ *
  * Copyright (C) 2017-2020  John A. Tuffen
  *
  * This program is free software: you can redistribute it and/or modify
@@ -27,22 +27,17 @@
 // Base-timer is running at 16MHz
 #define F_TIM (16000000L)
 
-// Fixed value to start the ADC
-// enable ADC, start conversion, prescaler = /64 gives us an ADC clock of 8MHz/64 (125kHz)
-#define ADCSRAVAL ( _BV(ADEN) | _BV(ADSC) | _BV(ADPS2) | _BV(ADPS1)  | _BV(ADIE) )
-
 // let the preprocessor calculate the various register values 'coz
 // they don't change after compile time
 #if ((F_TIM/(SRATE)) < 255)
-#define T1_MATCH ((F_TIM/(SRATE))-1)
-#define T1_PRESCALE _BV(CS00)  //prescaler clk/1 (i.e. 8MHz)
+#define T0_MATCH ((F_TIM/(SRATE))-1)
+#define T0_PRESCALE _BV(CS00)  //prescaler clk/1 (i.e. 8MHz)
 #else
-#define T1_MATCH (((F_TIM/8L)/(SRATE))-1)
-#define T1_PRESCALE _BV(CS01)  //prescaler clk/8 (i.e. 1MHz)
+#define T0_MATCH (((F_TIM/8L)/(SRATE))-1)
+#define T0_PRESCALE _BV(CS01)  //prescaler clk/8 (i.e. 1MHz)
 #endif
 
-
-#define OSCOUTREG (OCR2A)
+#define OSCOUTREG (OCR2A)     // This is the PWM register associated with timer2
 
 uint16_t          phase;      // The accumulated phase (distance through the wavetable)
 uint16_t          pi;         // wavetable current phase increment (how much phase will increase per sample)
@@ -51,62 +46,80 @@ void setup()
 {
   CLKPR = _BV(CLKPCE);
   CLKPR = 0;
-  
+
   ///////////////////////////////////////////////
-  // Set up Timer/Counter1 for 250kHz PWM output
-  TCCR2A = 0;                  // stop the timer
-  TCCR2B = 0;                  // stop the timer
-  TCNT2 = 0;                   // zero the timer
-  GTCCR = _BV(PSRASY);         // reset the prescaler
+  // Set up Timer/Counter 2 for PWM output
+  TCCR2A = 0;                          // stop the timer
+  TCCR2B = 0;                          // stop the timer
+  TCNT2  = 0;                          // zero the timer
+  GTCCR  = _BV(PSRASY);                // reset the prescaler
   TCCR2A = _BV(WGM20)  | _BV(WGM21) |  // fast PWM to OCRA
            _BV(COM2A1) | _BV(COM2A0);  // OCR2A set at match; cleared at start
   TCCR2B = _BV(CS20);                  // fast pwm part 2; no prescale on input clock
-  //OSCOUTREG = 128;                   // start with 50% duty cycle on the PWM
-  pinMode(11, OUTPUT);                 // PWM output pin (grains)
+
+  pinMode(11, OUTPUT);                 // Set pin 11 as an output — Grains PWM is here
 
   ///////////////////////////////////////////////
   // Set up Timer/Counter0 for sample-rate ISR
-  TCCR0B = 0;                 // stop the timer (no clock source)
-  TCNT0 = 0;                  // zero the timer
+  TCCR0B  = 0;                         // stop the timer (no clock source)
+  TCNT0   = 0;                         // zero the timer
 
-  TCCR0A = _BV(WGM01);        // CTC Mode
-  TCCR0B = T1_PRESCALE;
-  OCR0A  = T1_MATCH;          // calculated match value
-  TIMSK0 |= _BV(OCIE0A);
-
-  pinMode(8, OUTPUT);         // marker
+  TCCR0A  = _BV(WGM01);                // CTC Mode
+  TCCR0B  = T0_PRESCALE;               // Set the alculated prescaler value to start the timer
+  OCR0A   = T0_MATCH;                  // calculated match value
+  TIMSK0 |= _BV(OCIE0A);               // Enable the TIMER0_COMPA interrupt
 }
 
 // There are no real time constraints here, this is an idle loop after
 // all...
 void loop()
 {
-    pi = pgm_read_word(&octaveLookup[analogRead(2)]);
+  // Fetch a fixed-point phase-increment value from the lookup
+  // table over in calc.ino
+  pi = pgm_read_word(&octaveLookup[analogRead(2)]);
 }
 
-// deal with oscillator
+// deal with oscillator.
+// For frequency calculations, we need a fractional representation because
+// integers don't have the resolution. Since we're using a device without
+// native floating-point support, we implement a 'fixed-point' fractional
+// system. This means we can do integer maths, which the processor is Ok with!
+//
+// The fixed-point scheme uses 16 bits, where the top 10 bits are the integer
+// part, and the lower 6 bits are the fractional part.
+//
+// So, our 16 bits are arranged like this (integer vs. fractional)
+//
+// iiiiiiiiiiffffff
+//
+// In this scheme, the number 0b100000 (0x20, or 32) is equivalent to 0.5
+
 ISR(TIMER0_COMPA_vect)
 {
-  // Check that the sampling rate is running correctly (25kHz - see calc.h)
-  PORTB ^= 0x01;
   // increment the phase counter
   phase += pi;
 
-  // By shifting the 16 bit number by 6, we are left with a number
-  // in the range 0-1023 (0-0x3ff)
+  // By shifting the 16 bit number by 6, we remove the fractional part
+  // and we are left with the integer part (in the range 0-1023). This
+  // is actually truncating the value, for better fidelity (ha!) we could
+  // round it instead (by adding 0.5 before the truncation)
   uint16_t p = (phase) >> FRACBITS;
 
-  // look up the output-value based on the current phase counter (truncated)
+  // We could store our sinewave in a 1024-entry lookup table however
+  // we save space by recognising the symmetry of the waveshape and
+  // only storing 512 entries and playing it inverted for the second
+  // half.
 
-  // to save wavetable space, we play the wavetable forward (first half),
-  // then backwards (and inverted)
-  uint16_t ix = p < WTSIZE ? p : ((2*WTSIZE-1) - p);
+  // Calculate the index value (from 0-1023 to 0-511):
+  uint16_t ix = p & 0x1ff;
 
   // hangover from the dr1.a code. Can't be bothered to change it tbh.
+  // Two different half-height waves are added, we could of course
+  // just fetch a single full-height value.
   uint8_t s1 = pgm_read_byte(&sine[ix]);
   uint8_t s2 = pgm_read_byte(&sine[ix]);
   uint8_t s = s1 + s2;
 
   // invert the wave for the second half
-  OSCOUTREG = p < WTSIZE ? -s : s;
+  OSCOUTREG = p & 0x200 ? -s : s;
 }
